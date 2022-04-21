@@ -31,9 +31,14 @@ pub const ANNOTATION_PREFIX: &str = "aws.xray.annotations.";
 ///
 /// [AWS X-Ray daemon]: https://docs.aws.amazon.com/xray/latest/devguide/xray-daemon.html
 pub struct Layer {
-    handle: Handle,
-    connection: &'static xray_daemon::DaemonClient<xray_daemon::Connected>,
+    daemon: Daemon,
     service_name: String,
+}
+
+#[derive(Clone)]
+enum Daemon {
+    Async(&'static xray_daemon::DaemonClient<xray_daemon::Connected>),
+    Blocking(&'static xray_daemon::DaemonClient<xray_daemon::ConnectedBlocking>),
 }
 
 impl Layer {
@@ -43,21 +48,34 @@ impl Layer {
     /// emitted by this layer.
     pub async fn new(service_name: impl ToString) -> io::Result<Self> {
         Ok(Self {
-            handle: Handle::current(),
-            connection: Box::leak(Box::new(
+            daemon: Daemon::Async(Box::leak(Box::new(
                 xray_daemon::DaemonClient::default().connect().await?,
-            )),
+            ))),
+            service_name: service_name.to_string(),
+        })
+    }
+
+    pub fn new_blocking(service_name: impl ToString) -> io::Result<Self> {
+        Ok(Self {
+            daemon: Daemon::Blocking(Box::leak(Box::new(
+                xray_daemon::DaemonClient::default().connect_blocking()?,
+            ))),
             service_name: service_name.to_string(),
         })
     }
 
     /// Emit a given [`model::Segment`].
     fn send(&self, segment: &model::Segment) {
-        let connection = self.connection;
         let message = serde_json::to_vec(segment).unwrap();
-        let _ = self
-            .handle
-            .spawn(async move { connection.send(&message[..]).await });
+        match self.daemon {
+            Daemon::Async(connection) => {
+                let handle = Handle::current();
+                let _ = handle.spawn(async move { connection.send(&message[..]).await });
+            }
+            Daemon::Blocking(connection) => {
+                connection.send(&message[..]);
+            }
+        };
     }
 }
 
